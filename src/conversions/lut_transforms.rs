@@ -133,25 +133,54 @@ pub(crate) enum Grid4x3<'a> {
 }
 
 impl Grid4x3<'_> {
-    pub(crate) fn collect<E>(self, map: impl Fn(&[f32; 3]) -> E) -> Result<Vec<E>, CmsError> {
+    pub(crate) fn collect<E>(
+        &mut self,
+        mut map: impl FnMut(&[f32; 3]) -> E,
+    ) -> Result<Vec<E>, CmsError> {
         match self {
             Grid4x3::Whole(lut) => Ok(lut.as_chunks::<3>().0.iter().map(map).collect()),
             Grid4x3::Planes {
                 planes,
                 plane,
-                mut fill,
+                fill,
             } => {
                 let mut out = Vec::new();
-                out.try_reserve_exact(planes * plane)
-                    .map_err(|_| CmsError::OutOfMemory(planes * plane))?;
-                let mut part = try_vec![0f32; plane * 3];
-                for k in 0..planes {
+                out.try_reserve_exact(*planes * *plane)
+                    .map_err(|_| CmsError::OutOfMemory(*planes * *plane))?;
+                let mut part = try_vec![0f32; *plane * 3];
+                for k in 0..*planes {
                     fill(k, &mut part)?;
-                    out.extend(part.as_chunks::<3>().0.iter().map(&map));
+                    out.extend(part.as_chunks::<3>().0.iter().map(&mut map));
                 }
                 Ok(out)
             }
         }
+    }
+
+    /// Collect directly into fixed-point storage, discarding it on overflow.
+    /// Plane fills are reusable so the caller can regenerate float storage on failure.
+    /// Whole float grids have already been checked before backend dispatch.
+    pub(crate) fn collect_fixed_checked<T: PointeeSizeExpressible, const BIT_DEPTH: usize, E>(
+        &mut self,
+        map: impl Fn([i16; 3]) -> E,
+    ) -> Result<Option<Vec<E>>, CmsError> {
+        let check = !T::FINITE && matches!(self, Grid4x3::Planes { .. });
+        let q = if T::FINITE {
+            ((1i32 << BIT_DEPTH) - 1) as f32
+        } else {
+            16383.
+        };
+        let mut fits = true;
+        let out = self.collect(|x| {
+            let scaled = x.map(|v| v * q);
+            if check {
+                for v in scaled {
+                    fits &= (v > -32768.5) & (v < 32767.5);
+                }
+            }
+            map(scaled.map(|v| v.round() as i16))
+        })?;
+        Ok(if fits { Some(out) } else { None })
     }
 
     pub(crate) fn into_f32(self) -> Result<Vec<f32>, CmsError> {
@@ -733,14 +762,11 @@ where
             }
         };
 
-        // Plane grids must be finalized before choosing their storage format.
-        // Integer transforms retain the streaming construction path.
-        let (lut, options) = if options.prefer_fixed_point && BIT_DEPTH < 16 && !T::FINITE {
-            let lut = lut.into_f32()?;
-            let options = grid_options::<T, BIT_DEPTH>(&lut, options);
-            (Grid4x3::Whole(lut), options)
-        } else {
-            (lut, options)
+        // Whole grids already exist in f32; planes are checked while the backend
+        // collects them, without materializing an extra full grid.
+        let options = match &lut {
+            Grid4x3::Whole(lut) => grid_options::<T, BIT_DEPTH>(lut, options),
+            Grid4x3::Planes { .. } => options,
         };
 
         let is_dest_linear_profile = dest.color_space == DataColorSpace::Rgb
@@ -1095,6 +1121,76 @@ mod tests {
                     "{v} -> {rounded}"
                 );
             }
+        }
+    }
+
+    fn check_fixed_point_grid_planes_regenerate(overflow: Option<usize>) {
+        use std::cell::RefCell;
+
+        let calls = RefCell::new(Vec::new());
+        let mut grid = Grid4x3::Planes {
+            planes: 3,
+            plane: 2,
+            fill: Box::new(|k, out| {
+                calls.borrow_mut().push(k);
+                out.fill(if overflow == Some(k) { 3. } else { 0.12345 });
+                Ok(())
+            }),
+        };
+        let fixed = grid.collect_fixed_checked::<f32, 8, _>(|x| x).unwrap();
+        assert_eq!(*calls.borrow(), [0, 1, 2]);
+        if overflow.is_some() {
+            assert!(fixed.is_none());
+            let float = grid.collect(|x| *x).unwrap();
+            assert_eq!(*calls.borrow(), [0, 1, 2, 0, 1, 2]);
+            for k in 0..3 {
+                assert_eq!(
+                    float[k * 2],
+                    [if overflow == Some(k) { 3. } else { 0.12345 }; 3]
+                );
+            }
+        } else {
+            assert_eq!(fixed.unwrap(), vec![[2022; 3]; 6]);
+        }
+    }
+
+    #[test]
+    fn test_fixed_point_grid_planes_fit() {
+        check_fixed_point_grid_planes_regenerate(None);
+    }
+
+    #[test]
+    fn test_fixed_point_grid_planes_first_overflow() {
+        check_fixed_point_grid_planes_regenerate(Some(0));
+    }
+
+    #[test]
+    fn test_fixed_point_grid_planes_later_overflow() {
+        check_fixed_point_grid_planes_regenerate(Some(2));
+    }
+
+    #[test]
+    fn test_fixed_point_grid_cmyk_profile() {
+        let source =
+            ColorProfile::new_from_slice(&std::fs::read("./assets/us_swop_coated.icc").unwrap())
+                .unwrap();
+        let dest = ColorProfile::new_srgb();
+        for intent in [
+            RenderingIntent::Perceptual,
+            RenderingIntent::RelativeColorimetric,
+        ] {
+            let options = TransformOptions {
+                rendering_intent: intent,
+                ..Default::default()
+            };
+            let mut grid = grid_4x3_by_planes::<f32, 17, 8, 8192>(&source, &dest, options)
+                .unwrap()
+                .expect("CMYK profile must exercise plane construction");
+            assert!(
+                grid.collect_fixed_checked::<f32, 8, _>(|x| x)
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 

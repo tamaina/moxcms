@@ -496,7 +496,7 @@ impl Lut4x3Factory for DefaultLut4x3Factory {
         const BIT_DEPTH: usize,
         const BINS: usize,
     >(
-        lut: Grid4x3<'_>,
+        mut lut: Grid4x3<'_>,
         options: TransformOptions,
         color_space: DataColorSpace,
         is_linear: bool,
@@ -514,20 +514,14 @@ impl Lut4x3Factory for DefaultLut4x3Factory {
                 || color_space == DataColorSpace::Xyz
                 || options.interpolation_method == InterpolationMethod::Linear);
 
-        if use_fixed_point {
-            let q = if T::FINITE {
-                ((1i32 << BIT_DEPTH) - 1) as f32
-            } else {
-                ((1i32 << 14) - 1) as f32
-            };
-            let lut: Vec<AlignedI16x4> = lut.collect(|x| {
-                AlignedI16x4([
-                    (x[0] * q).round() as i16,
-                    (x[1] * q).round() as i16,
-                    (x[2] * q).round() as i16,
-                    0,
-                ])
-            })?;
+        let fixed = if use_fixed_point {
+            lut.collect_fixed_checked::<T, BIT_DEPTH, _>(|x| AlignedI16x4([x[0], x[1], x[2], 0]))?
+        } else {
+            None
+        };
+        if let Some(fixed) = fixed {
+            drop(lut);
+            let lut = fixed;
             return Ok(match options.barycentric_weight_scale {
                 BarycentricWeightScale::Low => {
                     Arc::new(

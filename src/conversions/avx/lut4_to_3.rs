@@ -224,7 +224,7 @@ impl Lut4x3Factory for AvxLut4x3Factory {
         const BIT_DEPTH: usize,
         const BINS: usize,
     >(
-        lut: Grid4x3<'_>,
+        mut lut: Grid4x3<'_>,
         options: TransformOptions,
         color_space: DataColorSpace,
         is_linear: bool,
@@ -235,20 +235,14 @@ impl Lut4x3Factory for AvxLut4x3Factory {
         (): LutBarycentricReduction<T, u8>,
         (): LutBarycentricReduction<T, u16>,
     {
-        if options.prefer_fixed_point && BIT_DEPTH < 16 {
-            let q: f32 = if T::FINITE {
-                ((1i32 << BIT_DEPTH as i32) - 1) as f32
-            } else {
-                ((1i32 << 14i32) - 1) as f32
-            };
-            let lut = lut.collect(|x| {
-                AvxAlignedI16([
-                    (x[0] * q).round() as i16,
-                    (x[1] * q).round() as i16,
-                    (x[2] * q).round() as i16,
-                    0,
-                ])
-            })?;
+        let fixed = if options.prefer_fixed_point && BIT_DEPTH < 16 {
+            lut.collect_fixed_checked::<T, BIT_DEPTH, _>(|x| AvxAlignedI16([x[0], x[1], x[2], 0]))?
+        } else {
+            None
+        };
+        if let Some(fixed) = fixed {
+            drop(lut);
+            let lut = fixed;
             return Ok(match options.barycentric_weight_scale {
                 BarycentricWeightScale::Low => {
                     let bins = BarycentricWeight::<i16>::create_ranged_256::<GRID_SIZE>();
@@ -299,7 +293,9 @@ impl Lut4x3Factory for AvxLut4x3Factory {
             std::arch::is_x86_feature_detected!("fma"),
             "Internal configuration error, this feature might not be called without `fma` feature"
         );
-        let lut = lut.collect(|x| SseAlignedF32([x[0], x[1], x[2], 0f32]))?;
+        let float_lut = lut.collect(|x| SseAlignedF32([x[0], x[1], x[2], 0f32]))?;
+        drop(lut);
+        let lut = float_lut;
         Ok(match options.barycentric_weight_scale {
             BarycentricWeightScale::Low => {
                 let bins = BarycentricWeight::<f32>::create_ranged_256::<GRID_SIZE>();

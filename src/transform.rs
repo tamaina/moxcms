@@ -1353,6 +1353,9 @@ mod tests {
             (3, false, 1),
             (4, false, 1),
             (4, true, 1),
+            // Overflow in the first plane and only after the first plane.
+            (4, true, 3),
+            (4, true, 4),
             #[cfg(feature = "extended_range")]
             (3, false, 2),
             #[cfg(feature = "extended_range")]
@@ -1396,7 +1399,7 @@ mod tests {
             destination.green_trc = Some(linear.clone());
             destination.blue_trc = Some(linear);
             destination.cicp = None;
-            if range == 1 {
+            if range == 1 || range >= 3 {
                 // The inverse parametric curve produces 4 at table input 1,
                 // even without the extended_range feature or option.
                 let curve = ToneReprCurve::Parametric(vec![1., 0.25, 0.]);
@@ -1417,10 +1420,13 @@ mod tests {
                     clut_table: LutStore::Store16(
                         (0..16)
                             .flat_map(|i| {
+                                // Case 4 is zero throughout the first K plane. Only later
+                                // planes exceed Q2.14, after valid nodes were collected.
+                                let max = if range == 4 && i & 1 == 0 { 0 } else { 65535 };
                                 [
-                                    ((i >> 3) & 1) * 65535,
-                                    ((i >> 2) & 1) * 65535,
-                                    ((i >> 1) & 1) * 65535,
+                                    ((i >> 3) & 1) * max,
+                                    ((i >> 2) & 1) * max,
+                                    ((i >> 1) & 1) * max,
                                 ]
                             })
                             .collect(),
@@ -1457,10 +1463,13 @@ mod tests {
                         options,
                     )
                     .unwrap();
-                let mut output = [0.; 3];
-                transform
-                    .transform(&vec![1.; channels as usize], &mut output)
-                    .unwrap();
+                let mut input = vec![1.; channels as usize];
+                for k in 0..17 {
+                    let sample = [0.12345, 0.45678, 0.78901, k as f32 / 16.];
+                    input.extend_from_slice(&sample[..channels as usize]);
+                }
+                let mut output = vec![0.; input.len() / channels as usize * 3];
+                transform.transform(&input, &mut output).unwrap();
                 output
             };
             let reference = run(TransformOptions {
@@ -1468,11 +1477,11 @@ mod tests {
                 ..options
             });
             let output = run(options);
-            for (&actual, &expected) in output.iter().zip(reference.iter()) {
-                if range != 0 {
+            for (i, (&actual, &expected)) in output.iter().zip(reference.iter()).enumerate() {
+                if range != 0 && i < 3 {
                     assert!(expected > 2., "reference must exceed Q2.14: {reference:?}");
                     assert!(actual > 2., "extended output was clipped: {output:?}");
-                } else {
+                } else if range == 0 {
                     assert!((0. ..=1.).contains(&expected));
                     assert!((0. ..=1.).contains(&actual));
                 }
