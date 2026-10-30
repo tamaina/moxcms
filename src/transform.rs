@@ -86,8 +86,9 @@ pub struct TransformOptions {
     ///
     /// Q2.13 for RGB->XYZ->RGB is used.
     /// LUT interpolation use Q0.15.
-    /// For floating-point LUT transforms, this preference is ignored when
-    /// `allow_extended_range_rgb_xyz` is enabled, preserving the floating-point grid.
+    /// Floating-point LUT transforms retain a floating-point grid when its values
+    /// cannot be stored in the i16 Q2.14 grid without saturation, independently of
+    /// `allow_extended_range_rgb_xyz`. Otherwise this preference is preserved.
     pub prefer_fixed_point: bool,
     /// Interpolation method for 3D LUT
     ///
@@ -109,8 +110,8 @@ pub struct TransformOptions {
     /// If gamma function is found, then it will be used instead of LUT table.
     /// This allows to work with excellent precision with extended range,
     /// at a cost of execution time.
-    /// LUT transforms also retain floating-point grids regardless of `prefer_fixed_point`,
-    /// avoiding fixed-point clipping and quantization of extended-range output.
+    /// LUT grid storage is selected independently: `prefer_fixed_point` is honored
+    /// when the final grid fits in i16 Q2.14, otherwise a floating-point grid is used.
     #[cfg(feature = "extended_range")]
     pub allow_extended_range_rgb_xyz: bool,
     // pub black_point_compensation: bool,
@@ -1342,10 +1343,23 @@ mod tests {
         assert_eq!(run(&srgb, &perceptual_only), run(&srgb, &aliased));
     }
 
-    #[cfg(all(feature = "lut", feature = "extended_range"))]
+    #[cfg(feature = "lut")]
     #[test]
     fn test_lut_extended_range_preserves_float_grid() {
-        for channels in [3, 4] {
+        for (channels, planes, range) in [
+            (3, false, 0),
+            (4, false, 0),
+            (4, true, 0),
+            (3, false, 1),
+            (4, false, 1),
+            (4, true, 1),
+            #[cfg(feature = "extended_range")]
+            (3, false, 2),
+            #[cfg(feature = "extended_range")]
+            (4, false, 2),
+            #[cfg(feature = "extended_range")]
+            (4, true, 2),
+        ] {
             let linear = ToneReprCurve::Lut(vec![]);
             let mut source = ColorProfile::new_srgb();
             // Synthetic A2B0: an identity CLUT followed by a matrix gain of two.
@@ -1382,9 +1396,52 @@ mod tests {
             destination.green_trc = Some(linear.clone());
             destination.blue_trc = Some(linear);
             destination.cicp = None;
+            if range == 1 {
+                // The inverse parametric curve produces 4 at table input 1,
+                // even without the extended_range feature or option.
+                let curve = ToneReprCurve::Parametric(vec![1., 0.25, 0.]);
+                destination.red_trc = Some(curve.clone());
+                destination.green_trc = Some(curve.clone());
+                destination.blue_trc = Some(curve);
+            }
+            if planes {
+                // lut16Type takes the grid_4x3_by_planes construction path.
+                source.lut_a_to_b_perceptual = Some(LutWarehouse::Lut(crate::LutDataType {
+                    num_input_channels: 4,
+                    num_output_channels: 3,
+                    num_clut_grid_points: 2,
+                    matrix: Matrix3d::IDENTITY,
+                    num_input_table_entries: 2,
+                    num_output_table_entries: 2,
+                    input_table: LutStore::Store16([0, 65535].repeat(4)),
+                    clut_table: LutStore::Store16(
+                        (0..16)
+                            .flat_map(|i| {
+                                [
+                                    ((i >> 3) & 1) * 65535,
+                                    ((i >> 2) & 1) * 65535,
+                                    ((i >> 1) & 1) * 65535,
+                                ]
+                            })
+                            .collect(),
+                    ),
+                    output_table: LutStore::Store16([0, 65535].repeat(3)),
+                    lut_type: crate::LutType::Lut16,
+                }));
+                destination.red_colorant.x *= 0.25;
+                destination.red_colorant.y *= 0.25;
+                destination.red_colorant.z *= 0.25;
+                destination.green_colorant.x *= 0.25;
+                destination.green_colorant.y *= 0.25;
+                destination.green_colorant.z *= 0.25;
+                destination.blue_colorant.x *= 0.25;
+                destination.blue_colorant.y *= 0.25;
+                destination.blue_colorant.z *= 0.25;
+            }
             let options = TransformOptions {
                 rendering_intent: RenderingIntent::RelativeColorimetric,
-                allow_extended_range_rgb_xyz: true,
+                #[cfg(feature = "extended_range")]
+                allow_extended_range_rgb_xyz: range == 2,
                 ..Default::default()
             };
             let run = |options| {
@@ -1412,10 +1469,15 @@ mod tests {
             });
             let output = run(options);
             for (&actual, &expected) in output.iter().zip(reference.iter()) {
-                assert!(expected > 2., "reference must exceed Q2.14: {reference:?}");
-                assert!(actual > 2., "extended output was clipped: {output:?}");
+                if range != 0 {
+                    assert!(expected > 2., "reference must exceed Q2.14: {reference:?}");
+                    assert!(actual > 2., "extended output was clipped: {output:?}");
+                } else {
+                    assert!((0. ..=1.).contains(&expected));
+                    assert!((0. ..=1.).contains(&actual));
+                }
                 assert!(
-                    (actual - expected).abs() < 1e-5,
+                    (actual - expected).abs() < if range != 0 { 1e-5 } else { 3e-4 },
                     "{output:?} vs {reference:?}"
                 );
             }

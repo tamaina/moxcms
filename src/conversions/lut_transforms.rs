@@ -43,6 +43,25 @@ use crate::{
 use num_traits::AsPrimitive;
 use std::sync::Arc;
 
+// Float grids use (v * 16383).round() as i16. Strict bounds account for
+// ties rounding away from zero, and also reject NaN and infinities.
+fn fits_fixed_point_grid(lut: &[f32]) -> bool {
+    lut.iter().fold(true, |fits, &v| {
+        let scaled = v * 16383.;
+        fits & (scaled > -32768.5) & (scaled < 32767.5)
+    })
+}
+
+fn grid_options<T: PointeeSizeExpressible, const BIT_DEPTH: usize>(
+    lut: &[f32],
+    mut options: TransformOptions,
+) -> TransformOptions {
+    if options.prefer_fixed_point && BIT_DEPTH < 16 && !T::FINITE {
+        options.prefer_fixed_point = fits_fixed_point_grid(lut);
+    }
+    options
+}
+
 pub(crate) struct MatrixStage {
     pub(crate) matrices: Vec<Matrix3f>,
 }
@@ -560,18 +579,6 @@ where
     (): LutBarycentricReduction<T, u8>,
     (): LutBarycentricReduction<T, u16>,
 {
-    // Extended-range floating-point output cannot be represented by the i16 Q2.14
-    // grids. Apply this before dispatching to any scalar or SIMD LUT factory.
-    #[cfg(feature = "extended_range")]
-    let options = if !T::FINITE && options.allow_extended_range_rgb_xyz {
-        TransformOptions {
-            prefer_fixed_point: false,
-            ..options
-        }
-    } else {
-        options
-    };
-
     let apply_bpc_scaling = |lut: &mut [f32]| {
         if let (Some(src_bp), Some(dest_bp)) = (
             source.detect_black_point(options.rendering_intent, TransformDirection::DeviceToPcs),
@@ -724,6 +731,16 @@ where
                 }
                 Grid4x3::Whole(lut)
             }
+        };
+
+        // Plane grids must be finalized before choosing their storage format.
+        // Integer transforms retain the streaming construction path.
+        let (lut, options) = if options.prefer_fixed_point && BIT_DEPTH < 16 && !T::FINITE {
+            let lut = lut.into_f32()?;
+            let options = grid_options::<T, BIT_DEPTH>(&lut, options);
+            (Grid4x3::Whole(lut), options)
+        } else {
+            (lut, options)
         };
 
         let is_dest_linear_profile = dest.color_space == DataColorSpace::Rgb
@@ -990,6 +1007,8 @@ where
             return Err(CmsError::UnsupportedProfileConnection);
         }
 
+        let options = grid_options::<T, BIT_DEPTH>(&lut, options);
+
         let is_dest_linear_profile = dest.color_space == DataColorSpace::Rgb
             && dest.is_matrix_shaper()
             && dest.is_linear_matrix_shaper();
@@ -1051,6 +1070,57 @@ where
         #[cfg(not(feature = "any_to_any"))]
         {
             Err(CmsError::UnsupportedProfileConnection)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fixed_point_grid_range() {
+        assert!(fits_fixed_point_grid(&[-2., 0., 1., 2.]));
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3., 3.] {
+            assert!(!fits_fixed_point_grid(&[0., v, 1.]));
+        }
+        // Check adjacent f32 values on both sides of each rounding boundary.
+        for boundary in [-32768.5f32 / 16383., 32767.5 / 16383.] {
+            for offset in -8i32..=8 {
+                let v = f32::from_bits(boundary.to_bits().wrapping_add_signed(offset));
+                let rounded = (v * 16383.).round();
+                assert_eq!(
+                    fits_fixed_point_grid(&[v]),
+                    (i16::MIN as f32..=i16::MAX as f32).contains(&rounded),
+                    "{v} -> {rounded}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fixed_point_grid_selection() {
+        for size in [33usize.pow(3) * 3, 17usize.pow(4) * 3] {
+            let mut lut = vec![2.; size];
+            let options = TransformOptions::default();
+            assert!(grid_options::<f32, 8>(&lut, options).prefer_fixed_point);
+            assert!(grid_options::<f64, 8>(&lut, options).prefer_fixed_point);
+            lut[size - 1] = 3.;
+            assert!(!grid_options::<f32, 8>(&lut, options).prefer_fixed_point);
+            assert!(!grid_options::<f64, 8>(&lut, options).prefer_fixed_point);
+            assert!(grid_options::<u8, 8>(&lut, options).prefer_fixed_point);
+            assert!(grid_options::<u16, 12>(&lut, options).prefer_fixed_point);
+            assert!(grid_options::<f32, 16>(&lut, options).prefer_fixed_point);
+            assert!(
+                !grid_options::<f32, 8>(
+                    &lut,
+                    TransformOptions {
+                        prefer_fixed_point: false,
+                        ..options
+                    }
+                )
+                .prefer_fixed_point
+            );
         }
     }
 }
