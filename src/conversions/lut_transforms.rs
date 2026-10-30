@@ -560,6 +560,18 @@ where
     (): LutBarycentricReduction<T, u8>,
     (): LutBarycentricReduction<T, u16>,
 {
+    // Extended-range floating-point output cannot be represented by the i16 Q2.14
+    // grids. Apply this before dispatching to any scalar or SIMD LUT factory.
+    #[cfg(feature = "extended_range")]
+    let options = if !T::FINITE && options.allow_extended_range_rgb_xyz {
+        TransformOptions {
+            prefer_fixed_point: false,
+            ..options
+        }
+    } else {
+        options
+    };
+
     let apply_bpc_scaling = |lut: &mut [f32]| {
         if let (Some(src_bp), Some(dest_bp)) = (
             source.detect_black_point(options.rendering_intent, TransformDirection::DeviceToPcs),

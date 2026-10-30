@@ -86,6 +86,8 @@ pub struct TransformOptions {
     ///
     /// Q2.13 for RGB->XYZ->RGB is used.
     /// LUT interpolation use Q0.15.
+    /// For floating-point LUT transforms, this preference is ignored when
+    /// `allow_extended_range_rgb_xyz` is enabled, preserving the floating-point grid.
     pub prefer_fixed_point: bool,
     /// Interpolation method for 3D LUT
     ///
@@ -107,6 +109,8 @@ pub struct TransformOptions {
     /// If gamma function is found, then it will be used instead of LUT table.
     /// This allows to work with excellent precision with extended range,
     /// at a cost of execution time.
+    /// LUT transforms also retain floating-point grids regardless of `prefer_fixed_point`,
+    /// avoiding fixed-point clipping and quantization of extended-range output.
     #[cfg(feature = "extended_range")]
     pub allow_extended_range_rgb_xyz: bool,
     // pub black_point_compensation: bool,
@@ -1336,6 +1340,86 @@ mod tests {
         };
         assert_eq!(run(&perceptual_only, &srgb), run(&aliased, &srgb));
         assert_eq!(run(&srgb, &perceptual_only), run(&srgb, &aliased));
+    }
+
+    #[cfg(all(feature = "lut", feature = "extended_range"))]
+    #[test]
+    fn test_lut_extended_range_preserves_float_grid() {
+        for channels in [3, 4] {
+            let linear = ToneReprCurve::Lut(vec![]);
+            let mut source = ColorProfile::new_srgb();
+            // Synthetic A2B0: an identity CLUT followed by a matrix gain of two.
+            // XYZ PCS scaling and conversion to linear RGB produce values above Q2.14.
+            if channels == 4 {
+                source.color_space = DataColorSpace::Cmyk;
+            }
+            let clut = (0..(1 << channels))
+                .flat_map(|i| {
+                    let i = i >> (channels - 3);
+                    [
+                        ((i >> 2) & 1) * 65535,
+                        ((i >> 1) & 1) * 65535,
+                        (i & 1) * 65535,
+                    ]
+                })
+                .collect();
+            source.lut_a_to_b_perceptual =
+                Some(LutWarehouse::Multidimensional(LutMultidimensionalType {
+                    num_input_channels: channels,
+                    num_output_channels: 3,
+                    grid_points: [2; 16],
+                    clut: Some(LutStore::Store16(clut)),
+                    a_curves: vec![linear.clone(); channels as usize],
+                    b_curves: vec![linear.clone(); 3],
+                    m_curves: vec![linear.clone(); 3],
+                    matrix: Matrix3d {
+                        v: [[2., 0., 0.], [0., 2., 0.], [0., 0., 2.]],
+                    },
+                    bias: Vector3d::default(),
+                }));
+            let mut destination = ColorProfile::new_srgb();
+            destination.red_trc = Some(linear.clone());
+            destination.green_trc = Some(linear.clone());
+            destination.blue_trc = Some(linear);
+            destination.cicp = None;
+            let options = TransformOptions {
+                rendering_intent: RenderingIntent::RelativeColorimetric,
+                allow_extended_range_rgb_xyz: true,
+                ..Default::default()
+            };
+            let run = |options| {
+                let transform = source
+                    .create_transform_f32(
+                        if channels == 3 {
+                            Layout::Rgb
+                        } else {
+                            Layout::Rgba
+                        },
+                        &destination,
+                        Layout::Rgb,
+                        options,
+                    )
+                    .unwrap();
+                let mut output = [0.; 3];
+                transform
+                    .transform(&vec![1.; channels as usize], &mut output)
+                    .unwrap();
+                output
+            };
+            let reference = run(TransformOptions {
+                prefer_fixed_point: false,
+                ..options
+            });
+            let output = run(options);
+            for (&actual, &expected) in output.iter().zip(reference.iter()) {
+                assert!(expected > 2., "reference must exceed Q2.14: {reference:?}");
+                assert!(actual > 2., "extended output was clipped: {output:?}");
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{output:?} vs {reference:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "options")]
